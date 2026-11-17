@@ -1,0 +1,81 @@
+# Rendered by entrypoint.sh (@@NAME@@ placeholders) into /etc/proxysql.cnf.
+# The runtime DB is deleted at every start, so this file is the single source of truth.
+
+datadir="/var/lib/proxysql"
+errorlog="/var/lib/proxysql/proxysql.log"
+
+admin_variables =
+{
+    admin_credentials="admin:@@PROXYSQL_ADMIN_PASSWORD@@;radmin:@@PROXYSQL_ADMIN_PASSWORD@@"
+    mysql_ifaces="0.0.0.0:6032"
+}
+
+mysql_variables =
+{
+    threads=4
+    interfaces="0.0.0.0:6033"
+    max_connections=2048
+    server_version="11.4.0-MariaDB"
+    default_schema="information_schema"
+    stacksize=1048576
+    poll_timeout=2000
+    have_compress=true
+    commands_stats=true
+    sessions_sort=true
+
+    # Backend connection handling
+    connect_timeout_server=3000
+    connect_retries_on_failure=10
+    connect_retries_delay=100
+    shun_on_failures=5
+    shun_recovery_time_sec=5
+    ping_interval_server_msec=10000
+    ping_timeout_server=200
+
+    # Monitoring (Galera-aware health checks)
+    monitor_username="proxysql_monitor"
+    monitor_password="@@PROXYSQL_MONITOR_PASSWORD@@"
+    monitor_connect_interval=2000
+    monitor_ping_interval=2000
+    monitor_read_only_interval=1500
+    monitor_galera_healthcheck_interval=1000
+    monitor_galera_healthcheck_timeout=600
+    monitor_history=600000
+}
+
+# One writer at a time (galera1 preferred through its weight). The other two
+# nodes are kept as backup writers (hostgroup 20) and take over automatically
+# when the writer is lost, desynced or leaves the primary component.
+mysql_galera_hostgroups =
+(
+    {
+        writer_hostgroup=10
+        backup_writer_hostgroup=20
+        reader_hostgroup=30
+        offline_hostgroup=40
+        active=1
+        max_writers=1
+        writer_is_also_reader=0
+        max_transactions_behind=100
+        comment="wordpress galera cluster"
+    }
+)
+
+mysql_servers =
+(
+    { address="galera1", port=3306, hostgroup=10, weight=1000, max_connections=500, comment="preferred writer" },
+    { address="galera2", port=3306, hostgroup=10, weight=100,  max_connections=500, comment="backup writer" },
+    { address="galera3", port=3306, hostgroup=10, weight=100,  max_connections=500, comment="backup writer" }
+)
+
+mysql_users =
+(
+    {
+        username="@@WORDPRESS_DB_USER@@"
+        password="@@WORDPRESS_DB_PASSWORD@@"
+        default_hostgroup=10
+        transaction_persistent=1
+        max_connections=1000
+        active=1
+    }
+)

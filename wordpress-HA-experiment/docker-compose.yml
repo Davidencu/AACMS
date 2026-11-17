@@ -1,0 +1,239 @@
+name: wordpress-ha
+
+# ---------------------------------------------------------------------------
+# Networks
+#   frontend : HAProxy <-> WordPress. Normal bridge (published ports live here).
+#   backend  : everything stateful. internal: true -> no route to the internet.
+# ---------------------------------------------------------------------------
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  wp_uploads:
+  redis_data:
+  galera1_data:
+  galera2_data:
+  galera3_data:
+
+# ---------------------------------------------------------------------------
+# Shared definitions
+# ---------------------------------------------------------------------------
+x-galera: &galera
+  image: mariadb:11.4
+  entrypoint: ["bash", "/galera/entrypoint.sh"]
+  restart: unless-stopped
+  networks: [backend]
+  stop_grace_period: 60s
+  environment: &galera-env
+    MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?run ./setup.sh first}
+    MARIADB_DATABASE: ${WORDPRESS_DB_NAME}
+    MARIADB_USER: ${WORDPRESS_DB_USER}
+    MARIADB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+    GALERA_SST_PASSWORD: ${GALERA_SST_PASSWORD}
+    PROXYSQL_MONITOR_PASSWORD: ${PROXYSQL_MONITOR_PASSWORD}
+    GALERA_PEERS: galera1,galera2,galera3
+  healthcheck:
+    test: ["CMD-SHELL", "mariadb -uroot -p\"$$MARIADB_ROOT_PASSWORD\" -Nse \"SHOW STATUS LIKE 'wsrep_local_state_comment'\" | grep -q Synced"]
+    interval: 5s
+    timeout: 5s
+    retries: 40
+    start_period: 20s
+
+x-proxysql: &proxysql
+  image: proxysql/proxysql:2.7.3
+  entrypoint: ["bash", "/proxysql/entrypoint.sh"]
+  restart: unless-stopped
+  environment:
+    PROXYSQL_ADMIN_PASSWORD: ${PROXYSQL_ADMIN_PASSWORD}
+    PROXYSQL_MONITOR_PASSWORD: ${PROXYSQL_MONITOR_PASSWORD}
+    WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
+    WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+  volumes:
+    - ./proxysql/entrypoint.sh:/proxysql/entrypoint.sh:ro,z
+    - ./proxysql/proxysql.cnf.tmpl:/proxysql/proxysql.cnf.tmpl:ro,z
+  depends_on:
+    galera1: { condition: service_healthy }
+    galera2: { condition: service_healthy }
+    galera3: { condition: service_healthy }
+  healthcheck:
+    # A real query through the proxy, so this also proves a writer is reachable.
+    test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6033 -u\"$$WORDPRESS_DB_USER\" -p\"$$WORDPRESS_DB_PASSWORD\" -Nse 'SELECT 1' | grep -q 1"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+    start_period: 10s
+
+x-wordpress-env: &wordpress-env
+  WORDPRESS_DB_HOST: ${WORDPRESS_DB_HOST:-proxysql:6033}
+  WORDPRESS_DB_NAME: ${WORDPRESS_DB_NAME}
+  WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
+  WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+  WORDPRESS_URL: ${WORDPRESS_URL}
+  WORDPRESS_REDIS_HOST: redis
+  WORDPRESS_REDIS_PASSWORD: ${REDIS_PASSWORD}
+  WORDPRESS_AUTH_KEY: ${WORDPRESS_AUTH_KEY}
+  WORDPRESS_SECURE_AUTH_KEY: ${WORDPRESS_SECURE_AUTH_KEY}
+  WORDPRESS_LOGGED_IN_KEY: ${WORDPRESS_LOGGED_IN_KEY}
+  WORDPRESS_NONCE_KEY: ${WORDPRESS_NONCE_KEY}
+  WORDPRESS_AUTH_SALT: ${WORDPRESS_AUTH_SALT}
+  WORDPRESS_SECURE_AUTH_SALT: ${WORDPRESS_SECURE_AUTH_SALT}
+  WORDPRESS_LOGGED_IN_SALT: ${WORDPRESS_LOGGED_IN_SALT}
+  WORDPRESS_NONCE_SALT: ${WORDPRESS_NONCE_SALT}
+
+services:
+  # -------------------------------------------------------------------------
+  # Edge: TLS termination, L7 load balancing, health checks
+  # -------------------------------------------------------------------------
+  haproxy:
+    image: haproxy:3.0
+    restart: unless-stopped
+    networks: [frontend]
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+      - "${HTTPS_PORT:-8443}:8443"
+      - "127.0.0.1:${STATS_PORT:-8404}:8404"
+    environment:
+      HTTPS_PORT: ${HTTPS_PORT:-8443}
+      STATS_USER: ${STATS_USER}
+      STATS_PASSWORD: ${STATS_PASSWORD}
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro,z
+      - ./certs:/certs:ro,z
+    depends_on:
+      wordpress: { condition: service_healthy }
+
+  # -------------------------------------------------------------------------
+  # Application tier: scale with `docker compose up -d --scale wordpress=N`
+  # -------------------------------------------------------------------------
+  wordpress:
+    build: ./wordpress
+    image: wordpress-ha:local
+    restart: unless-stopped
+    deploy:
+      replicas: ${WORDPRESS_REPLICAS:-2}
+    networks: [frontend, backend]
+    environment: *wordpress-env
+    tmpfs:
+      - /var/www/html:size=256m,mode=0755
+    volumes:
+      - wp_uploads:/var/www/html/wp-content/uploads
+    depends_on:
+      wp-init:    { condition: service_completed_successfully }
+      proxysql-1: { condition: service_healthy }
+      proxysql-2: { condition: service_healthy }
+      redis:      { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/healthz.php >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # One-shot installer (talks to ProxySQL-2, as in the diagram)
+  wp-init:
+    image: wordpress-ha:local
+    build: ./wordpress
+    restart: "no"
+    networks: [backend]
+    user: www-data
+    entrypoint: ["/usr/local/bin/wp-init.sh"]
+    environment:
+      <<: *wordpress-env
+      WORDPRESS_DB_HOST: proxysql-2:6033
+      WORDPRESS_TITLE: ${WORDPRESS_TITLE:-WordPress HA}
+      WORDPRESS_ADMIN_USER: ${WORDPRESS_ADMIN_USER}
+      WORDPRESS_ADMIN_PASSWORD: ${WORDPRESS_ADMIN_PASSWORD}
+      WORDPRESS_ADMIN_EMAIL: ${WORDPRESS_ADMIN_EMAIL}
+    depends_on:
+      proxysql-2: { condition: service_healthy }
+      redis:      { condition: service_healthy }
+
+  # Singleton scheduler (WordPress nodes run with DISABLE_WP_CRON)
+  wp-cron:
+    image: wordpress-ha:local
+    restart: unless-stopped
+    networks: [backend]
+    user: www-data
+    entrypoint: ["/usr/local/bin/wp-cron.sh"]
+    environment: *wordpress-env
+    volumes:
+      - wp_uploads:/usr/src/wordpress/wp-content/uploads
+    depends_on:
+      wp-init: { condition: service_completed_successfully }
+
+  # -------------------------------------------------------------------------
+  # Shared state: object cache + sessions
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # Database proxies. Both answer to the DNS alias "proxysql"; Docker's
+  # resolver only returns live containers, so WordPress skips a dead proxy.
+  # -------------------------------------------------------------------------
+  proxysql-1:
+    <<: *proxysql
+    hostname: proxysql-1
+    networks:
+      backend:
+        aliases: [proxysql]
+
+  proxysql-2:
+    <<: *proxysql
+    hostname: proxysql-2
+    networks:
+      backend:
+        aliases: [proxysql]
+
+  # -------------------------------------------------------------------------
+  # MariaDB Galera cluster (synchronous multi-master replication).
+  # galera1 bootstraps on a cold start; galera2/3 always join.
+  # -------------------------------------------------------------------------
+  galera1:
+    <<: *galera
+    hostname: galera1
+    environment:
+      <<: *galera-env
+      GALERA_BOOTSTRAP: "1"
+      GALERA_FORCE_BOOTSTRAP: ${GALERA_FORCE_BOOTSTRAP:-0}
+    volumes:
+      - galera1_data:/var/lib/mysql
+      - ./galera/galera.cnf:/etc/mysql/conf.d/galera.cnf:ro,z
+      - ./galera/entrypoint.sh:/galera/entrypoint.sh:ro,z
+      - ./galera/initdb:/docker-entrypoint-initdb.d:ro,z
+
+  galera2:
+    <<: *galera
+    hostname: galera2
+    depends_on:
+      galera1: { condition: service_healthy }
+    volumes:
+      - galera2_data:/var/lib/mysql
+      - ./galera/galera.cnf:/etc/mysql/conf.d/galera.cnf:ro,z
+      - ./galera/entrypoint.sh:/galera/entrypoint.sh:ro,z
+      - ./galera/initdb:/docker-entrypoint-initdb.d:ro,z
+
+  galera3:
+    <<: *galera
+    hostname: galera3
+    depends_on:
+      galera1: { condition: service_healthy }
+    volumes:
+      - galera3_data:/var/lib/mysql
+      - ./galera/galera.cnf:/etc/mysql/conf.d/galera.cnf:ro,z
+      - ./galera/entrypoint.sh:/galera/entrypoint.sh:ro,z
+      - ./galera/initdb:/docker-entrypoint-initdb.d:ro,z

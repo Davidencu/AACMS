@@ -1,0 +1,22 @@
+[mysqld]
+# --- InnoDB / replication requirements for Galera ---
+binlog_format                  = ROW
+default_storage_engine         = InnoDB
+innodb_autoinc_lock_mode       = 2
+innodb_flush_log_at_trx_commit = 2
+innodb_buffer_pool_size        = 128M
+bind_address                   = 0.0.0.0
+
+character_set_server = utf8mb4
+collation_server     = utf8mb4_unicode_520_ci
+max_connections      = 500
+
+# --- Galera ---
+# wsrep_cluster_address, wsrep_node_address, wsrep_node_name and wsrep_sst_auth
+# are passed on the command line by entrypoint.sh.
+wsrep_on               = ON
+wsrep_provider         = /usr/lib/galera/libgalera_smm.so
+wsrep_cluster_name     = wordpress-ha
+wsrep_sst_method       = mariabackup
+wsrep_slave_threads    = 4
+wsrep_provider_options = "gcache.size=128M"
