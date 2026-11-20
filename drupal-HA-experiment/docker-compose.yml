@@ -1,0 +1,108 @@
+name: drupal-ha
+
+# ---------------------------------------------------------------------------
+# Networks
+#   frontend : HAProxy <-> Drupal nodes. Normal bridge (published port lives here).
+#   backend  : database only. internal: true -> no route to the internet.
+# ---------------------------------------------------------------------------
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  drupal_files:    # public files (sites/default/files), shared by all nodes
+  drupal_private:  # private files + config sync dir + install lock, shared by all nodes
+  postgres_data:
+
+# ---------------------------------------------------------------------------
+# One definition, three containers (drupal1, drupal2, drupal3).
+# ---------------------------------------------------------------------------
+x-drupal: &drupal
+  image: drupal:11-apache
+  restart: unless-stopped
+  networks: [frontend, backend]
+  entrypoint: ["bash", "/ha/entrypoint.sh"]
+  command: ["apache2-foreground"]
+  environment:
+    DRUPAL_DB_HOST: postgres
+    DRUPAL_DB_NAME: ${DRUPAL_DB_NAME}
+    DRUPAL_DB_USER: ${DRUPAL_DB_USER}
+    DRUPAL_DB_PASSWORD: ${DRUPAL_DB_PASSWORD}
+    DRUPAL_HASH_SALT: ${DRUPAL_HASH_SALT:?run ./setup.sh first}
+    DRUPAL_TRUSTED_HOSTS: ${DRUPAL_TRUSTED_HOSTS:-localhost,127.0.0.1}
+    DRUPAL_SITE_NAME: ${DRUPAL_SITE_NAME:-Drupal HA}
+    DRUPAL_ADMIN_USER: ${DRUPAL_ADMIN_USER}
+    DRUPAL_ADMIN_PASSWORD: ${DRUPAL_ADMIN_PASSWORD}
+    DRUPAL_ADMIN_EMAIL: ${DRUPAL_ADMIN_EMAIL}
+  volumes:
+    - drupal_files:/opt/drupal/web/sites/default/files
+    - drupal_private:/opt/drupal/private
+    - ./drupal/settings.php:/opt/drupal/web/sites/default/settings.php:ro,z
+    - ./drupal/entrypoint.sh:/ha/entrypoint.sh:ro,z
+    - ./drupal/install.php:/ha/install.php:ro,z
+  depends_on:
+    postgres: { condition: service_healthy }
+  healthcheck:
+    # Renders a page that needs the database, so it also proves the node can reach it.
+    test: ["CMD-SHELL", "curl -fsS -o /dev/null -H 'Host: localhost' http://127.0.0.1/user/login"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+    # The first node to start installs Drupal (about a minute); the others wait for it.
+    start_period: 240s
+
+services:
+  # -------------------------------------------------------------------------
+  # Edge: load balancing + health checks
+  # -------------------------------------------------------------------------
+  haproxy:
+    image: haproxy:3.0
+    restart: unless-stopped
+    networks: [frontend]
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+      - "127.0.0.1:${STATS_PORT:-8404}:8404"
+    environment:
+      STATS_USER: ${STATS_USER}
+      STATS_PASSWORD: ${STATS_PASSWORD}
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro,z
+    depends_on:
+      drupal1: { condition: service_healthy }
+      drupal2: { condition: service_healthy }
+      drupal3: { condition: service_healthy }
+
+  # -------------------------------------------------------------------------
+  # Application tier: three identical, stateless Drupal containers
+  # -------------------------------------------------------------------------
+  drupal1:
+    <<: *drupal
+    hostname: drupal1
+
+  drupal2:
+    <<: *drupal
+    hostname: drupal2
+
+  drupal3:
+    <<: *drupal
+    hostname: drupal3
+
+  # -------------------------------------------------------------------------
+  # Shared database
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      POSTGRES_DB: ${DRUPAL_DB_NAME}
+      POSTGRES_USER: ${DRUPAL_DB_USER}
+      POSTGRES_PASSWORD: ${DRUPAL_DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
